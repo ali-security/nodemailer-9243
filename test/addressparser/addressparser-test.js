@@ -251,18 +251,14 @@ describe('#addressparser', () => {
 
     it('should handle particularily bad input, unescaped colon correctly', () => {
         let input = 'FirstName Surname-WithADash :: Company <firstname@company.com>';
+        // Nested groups are not allowed per RFC 5322, so they should be flattened
         let expected = [
             {
                 name: 'FirstName Surname-WithADash',
                 group: [
                     {
-                        name: undefined,
-                        group: [
-                            {
-                                address: 'firstname@company.com',
-                                name: 'Company'
-                            }
-                        ]
+                        address: 'firstname@company.com',
+                        name: 'Company'
                     }
                 ]
             }
@@ -308,5 +304,140 @@ describe('#addressparser', () => {
             }
         ];
         assert.deepStrictEqual(addressparser(input), expected);
+    });
+
+    // DoS protection tests for deeply nested groups (CVE-like vulnerability fix)
+    describe('Nested group DoS protection', () => {
+        /**
+         * Helper to build deeply nested group structure
+         * e.g., depth=3 produces: "g0: g1: g2: user@example.com;"
+         */
+        function buildDeepGroup(depth) {
+            let parts = [];
+            for (let i = 0; i < depth; i++) {
+                parts.push(`g${i}:`);
+            }
+            return parts.join(' ') + ' user@example.com;';
+        }
+
+        it('should handle moderately nested groups (depth 10)', () => {
+            let input = buildDeepGroup(10);
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+            // Should successfully extract the email from nested structure
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'user@example.com');
+        });
+
+        it('should handle nested groups at depth limit (depth 50)', () => {
+            let input = buildDeepGroup(50);
+            let result = addressparser(input);
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+            // At the limit, should still work
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'user@example.com');
+        });
+
+        it('should safely truncate groups exceeding depth limit (depth 100)', () => {
+            let input = buildDeepGroup(100);
+            let result = addressparser(input);
+            // Should not throw stack overflow
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+            // Group is truncated due to depth limit - members beyond limit are dropped
+        });
+
+        it('should not crash with malicious deeply nested input (depth 3000)', () => {
+            // This would previously cause "Maximum call stack size exceeded"
+            let input = buildDeepGroup(3000);
+            let start = Date.now();
+            let result;
+
+            // Must not throw
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            let elapsed = Date.now() - start;
+            // Should complete quickly (under 1 second), not hang
+            assert.ok(elapsed < 1000, `Parser took too long: ${elapsed}ms`);
+
+            // Should return a valid result structure
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.ok(result[0].group);
+        });
+
+        it('should not crash with extreme nesting depth (depth 10000)', () => {
+            let input = buildDeepGroup(10000);
+            let start = Date.now();
+            let result;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            let elapsed = Date.now() - start;
+            assert.ok(elapsed < 2000, `Parser took too long: ${elapsed}ms`);
+            assert.ok(Array.isArray(result));
+        });
+
+        it('should handle multiple deeply nested groups in same input', () => {
+            let input = buildDeepGroup(100) + ', ' + buildDeepGroup(100);
+            let result;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            // Should parse both groups
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].name, 'g0');
+            assert.strictEqual(result[1].name, 'g0');
+        });
+
+        it('should handle mixed normal and deeply nested addresses', () => {
+            let input = 'normal@example.com, ' + buildDeepGroup(200) + ', another@test.com';
+            let result;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input);
+            });
+
+            assert.strictEqual(result.length, 3);
+            assert.strictEqual(result[0].address, 'normal@example.com');
+            assert.strictEqual(result[1].name, 'g0');
+            assert.strictEqual(result[2].address, 'another@test.com');
+        });
+
+        it('should preserve normal functionality while protecting against DoS', () => {
+            // Normal nested groups (allowed up to depth limit) should work correctly
+            let input = 'Outer: Inner: deep@example.com; ;';
+            let result = addressparser(input);
+
+            assert.strictEqual(result.length, 1);
+            assert.strictEqual(result[0].name, 'Outer');
+            assert.ok(result[0].group);
+            // Inner group should be flattened
+            assert.strictEqual(result[0].group.length, 1);
+            assert.strictEqual(result[0].group[0].address, 'deep@example.com');
+        });
+
+        it('should work correctly with flatten option on deeply nested input', () => {
+            let input = buildDeepGroup(100);
+            let result;
+
+            assert.doesNotThrow(() => {
+                result = addressparser(input, { flatten: true });
+            });
+
+            // Should return flattened array without crashing
+            assert.ok(Array.isArray(result));
+        });
     });
 });
